@@ -3,6 +3,7 @@ import os
 import json
 import time
 import requests
+from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
 
@@ -26,20 +27,30 @@ for _p in (
     except Exception:
         pass
 
-# DuckDB connection (optional - falls back to HTTP API if unavailable)
+# DuckDB connection (optional - HTTP fallback used if unavailable)
 CON = None
+DUCKDB_ERROR = None
 try:
     import duckdb
 
     CON = duckdb.connect()
+    # Vercel's filesystem is read-only except /tmp - point extensions there
+    _extdir = os.path.join(os.environ.get("TMPDIR", "/tmp"), "duckdb_ext")
     try:
-        # httpfs is statically bundled in recent wheels - no download needed
+        os.makedirs(_extdir, exist_ok=True)
+        CON.execute(f"SET extension_directory='{_extdir}';")
+    except Exception:
+        pass
+    try:
         CON.execute("LOAD httpfs;")
     except Exception:
-        CON.execute("INSTALL httpfs; LOAD httpfs;")
+        # httpfs must be downloaded to a writable extension directory
+        CON.execute("INSTALL httpfs;")
+        CON.execute("LOAD httpfs;")
     CON.execute("SET enable_http_metadata_cache = true;")
-except Exception:
+except Exception as _e:
     CON = None
+    DUCKDB_ERROR = f"{type(_e).__name__}: {_e}"
 
 # Vercel Hobby supports up to 300s with Fluid compute
 TIME_BUDGET = 280.0
@@ -48,7 +59,7 @@ TIME_BUDGET = 280.0
 def clean_field(value):
     if not value or str(value).strip().lower() in ["null", "none", "", "nulllll", "-", "0", "na", "n/a"]:
         return None
-    return str(value).strip()
+    return str(value).trim()
 
 
 def find_row_groups_by_range(phone_digits):
@@ -96,7 +107,7 @@ def duckdb_scan(rg, phone_digits):
 def http_fetch_batch(offset):
     """Fetch a batch of rows from the Hugging Face Datasets Server."""
     try:
-        resp = requests.get(f"{HF_ROWS_URL}&offset={offset}&limit=100", timeout=8)
+        resp = requests.get(f"{HF_ROWS_URL}&offset={offset}&limit=100", timeout=15)
         if resp.status_code == 200:
             rows = resp.json().get("rows", [])
             if rows:
@@ -107,65 +118,34 @@ def http_fetch_batch(offset):
 
 
 def http_scan(rg, phone_digits):
-    """Fallback scan using the Hugging Face Datasets Server rows API."""
+    """Fallback scan using the Hugging Face Datasets Server rows API (parallel batches)."""
     val = int(phone_digits)
     start_off = rg["o"]
     end_off = rg["o"] + rg["r"]
     ratio = (rg["M"] - val) / (rg["M"] - rg["m"]) if rg["M"] > rg["m"] else 0
-    offset = max(start_off, int(start_off + ratio * rg["r"]) - 50)
+    base = max(start_off, int(start_off + ratio * rg["r"]) - 3000)
 
-    jump = 100
-    checked = set()
-    offsets_to_check = [offset]
+    # Scan a wide window of batches in parallel around the interpolated offset
+    offsets = list(range(base, min(base + 12000, end_off), 100))
 
-    for _ in range(6):
-        new_offsets = []
-        for off in offsets_to_check:
-            if off in checked or off < start_off or off >= end_off:
-                continue
-            checked.add(off)
+    def check(off):
+        batch = http_fetch_batch(off)
+        for row in batch:
+            if str(row.get("mobile", "")).strip() == phone_digits:
+                return {
+                    "mobile": phone_digits,
+                    "name": clean_field(row.get("name")),
+                    "fname": clean_field(row.get("fname")),
+                    "address": clean_field(row.get("address")),
+                    "alt": clean_field(row.get("alt")),
+                    "circle": clean_field(row.get("circle")),
+                }
+        return None
 
-            batch = http_fetch_batch(off)
-            if not batch:
-                continue
-
-            for row in batch:
-                if str(row.get("mobile", "")).strip() == phone_digits:
-                    return {
-                        "mobile": phone_digits,
-                        "name": clean_field(row.get("name")),
-                        "fname": clean_field(row.get("fname")),
-                        "address": clean_field(row.get("address")),
-                        "alt": clean_field(row.get("alt")),
-                        "circle": clean_field(row.get("circle")),
-                    }
-
-            first_mob = str(batch[0].get("mobile", "")).strip()
-            last_mob = str(batch[-1].get("mobile", "")).strip()
-            if first_mob.isdigit() and last_mob.isdigit():
-                first_val = int(first_mob)
-                last_val = int(last_mob)
-                if last_val <= val <= first_val:
-                    best = min(
-                        batch,
-                        key=lambda r: abs(int(str(r.get("mobile", "")).strip()) - val)
-                        if str(r.get("mobile", "")).strip().isdigit()
-                        else float("inf"),
-                    )
-                    return {
-                        "mobile": phone_digits,
-                        "name": clean_field(best.get("name")),
-                        "fname": clean_field(best.get("fname")),
-                        "address": clean_field(best.get("address")),
-                        "alt": clean_field(best.get("alt")),
-                        "circle": clean_field(best.get("circle")),
-                    }
-
-            new_offsets.append(off - jump)
-            new_offsets.append(off + jump)
-
-        offsets_to_check = new_offsets
-        jump = min(jump * 2, 3000)
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        for res in ex.map(check, offsets):
+            if res:
+                return res
 
     return None
 
@@ -187,6 +167,15 @@ def query_hf_database(phone):
         if record:
             return record
 
+    # Fallback to HTTP API if DuckDB unavailable
+    if CON is None:
+        for rg in cands:
+            if time.time() - time_start > TIME_BUDGET:
+                break
+            record = http_scan(rg, phone_digits)
+            if record:
+                return record
+
     return None
 
 
@@ -196,6 +185,7 @@ def health():
         "status": "ok",
         "row_groups": len(REMOTE_RGS),
         "duckdb": CON is not None,
+        "duckdb_error": DUCKDB_ERROR,
     })
 
 
