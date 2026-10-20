@@ -59,9 +59,12 @@ try:
         CON.execute("LOAD httpfs;")
 
     CON.execute("SET enable_http_metadata_cache = true;")
+    CON.execute("SET http_timeout = 60000;")
 except Exception as _e:
     CON = None
     DUCKDB_ERROR = f"{type(_e).__name__}: {_e}"
+
+LAST_ERROR = None
 
 # Vercel Hobby supports up to 300s with Fluid compute
 TIME_BUDGET = 280.0
@@ -110,8 +113,9 @@ def duckdb_scan(rg, phone_digits):
                 "alt": clean_field(r[4]),
                 "circle": clean_field(r[5]),
             }
-    except Exception:
-        pass
+    except Exception as _e:
+        global LAST_ERROR
+        LAST_ERROR = f"{type(_e).__name__}: {_e}"
     return None
 
 
@@ -197,7 +201,33 @@ def health():
         "row_groups": len(REMOTE_RGS),
         "duckdb": CON is not None,
         "duckdb_error": DUCKDB_ERROR,
+        "last_query_error": LAST_ERROR,
     })
+
+
+@app.route("/diag")
+def diag():
+    """Diagnostic: run one real query and report timing/errors."""
+    t0 = time.time()
+    sql = (
+        "SELECT mobile, name FROM parquet_scan('" + HF_PARQUET_URL + "', file_row_number=true) "
+        "WHERE file_row_number >= 233228287 AND file_row_number < 233351167 "
+        "AND mobile = '8168781901' LIMIT 1"
+    )
+    try:
+        rows = CON.execute(sql).fetchall() if CON else None
+        return jsonify({
+            "ok": True,
+            "seconds": round(time.time() - t0, 2),
+            "rows": rows,
+            "last_query_error": LAST_ERROR,
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "seconds": round(time.time() - t0, 2),
+            "error": f"{type(e).__name__}: {e}",
+        }), 500
 
 
 @app.route("/api")
