@@ -4,11 +4,11 @@
     {
       "src": "api/index.py",
       "use": "@vercel/python",
-      "includeFiles": ["api/rg_index.json", "rg_index.json"]
+      "includeFiles": ["api/rg_index.json"]
     }
   ],
   "routes": [
     { "src": "/(.*)", "dest": "/api/index.py" }
   ],
-  "maxDuration": 10
+  "maxDuration": 300
 }

@@ -1,15 +1,19 @@
 from flask import Flask, request, jsonify
 import os
 import json
-import requests
 import time
+import duckdb
 
 app = Flask(__name__)
 
-HF_DATASET = "HiTeckGroup/HiTeckNuMinfo"
-HF_ROWS_URL = f"https://datasets-server.huggingface.co/rows?dataset={HF_DATASET}&config=default&split=train"
+HF_PARQUET_URL = "https://huggingface.co/datasets/HiTeckGroup/HiTeckNuMinfo/resolve/main/users_data.parquet"
 
-# Load row group index at cold start (bundled with the function)
+# DuckDB connection with remote HTTP parquet access (Linux wheel supported on Vercel)
+con = duckdb.connect()
+con.execute("INSTALL httpfs; LOAD httpfs;")
+con.execute("SET enable_http_metadata_cache = true;")
+
+# Load pre-computed row group index at cold start
 REMOTE_RGS = []
 for _p in (
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "rg_index.json"),
@@ -25,7 +29,8 @@ for _p in (
     except Exception:
         pass
 
-TIME_BUDGET = 8.0  # seconds (Vercel free tier: 10s)
+# Vercel Hobby allows up to 300s with Fluid compute
+TIME_BUDGET = 280.0
 
 
 def clean_field(value):
@@ -34,98 +39,48 @@ def clean_field(value):
     return str(value).strip()
 
 
-def fetch_batch(offset):
-    url = f"{HF_ROWS_URL}&offset={offset}&limit=100"
-    try:
-        resp = requests.get(url, timeout=6)
-        if resp.status_code == 200:
-            rows = resp.json().get("rows", [])
-            if rows:
-                return [r.get("row", {}) for r in rows]
-    except Exception:
-        pass
-    return []
-
-
 def find_row_groups_by_range(phone_digits):
+    """Find candidate row groups whose min/max range contains this number."""
     val = int(phone_digits)
     cands = [r for r in REMOTE_RGS if r["m"] <= val <= r["M"]]
     if not cands:
         cands = sorted(REMOTE_RGS, key=lambda r: min(abs(r["m"] - val), abs(r["M"] - val)))
     else:
         cands.sort(key=lambda r: r["M"] - r["m"])
-    return cands[:5]
+    return cands
 
 
-def scan_within_row_group(rg, phone_digits, time_start):
-    val = int(phone_digits)
+def scan_row_group(rg, phone_digits):
+    """Scan one row group of the remote parquet file for an exact mobile match."""
     start_off = rg["o"]
-    span = rg["M"] - rg["m"]
-    end_off = start_off + rg["r"]
-
-    ratio = (rg["M"] - val) / span if span > 0 else 0
-    offset = max(start_off, int(start_off + ratio * rg["r"]) - 50)
-
-    jump = 100
-    checked = set()
-    offsets_to_check = [offset]
-
-    for attempt in range(6):
-        if time.time() - time_start > TIME_BUDGET:
-            return None
-
-        new_offsets = []
-        for off in offsets_to_check:
-            if off in checked or off < start_off or off >= end_off:
-                continue
-            checked.add(off)
-
-            batch = fetch_batch(off)
-            if not batch:
-                continue
-
-            for row in batch:
-                if str(row.get("mobile", "")).strip() == phone_digits:
-                    return {
-                        "mobile": phone_digits,
-                        "name": clean_field(row.get("name")),
-                        "fname": clean_field(row.get("fname")),
-                        "address": clean_field(row.get("address")),
-                        "alt": clean_field(row.get("alt")),
-                        "circle": clean_field(row.get("circle")),
-                    }
-
-            first_mob = str(batch[0].get("mobile", "")).strip()
-            last_mob = str(batch[-1].get("mobile", "")).strip()
-            if first_mob.isdigit() and last_mob.isdigit():
-                first_val = int(first_mob)
-                last_val = int(last_mob)
-                if last_val <= val <= first_val:
-                    best = min(
-                        batch,
-                        key=lambda r: abs(int(str(r.get("mobile", "")).strip()) - val)
-                        if str(r.get("mobile", "")).strip().isdigit()
-                        else float("inf"),
-                    )
-                    return {
-                        "mobile": phone_digits,
-                        "name": clean_field(best.get("name")),
-                        "fname": clean_field(best.get("fname")),
-                        "address": clean_field(best.get("address")),
-                        "alt": clean_field(best.get("alt")),
-                        "circle": clean_field(best.get("circle")),
-                    }
-
-            new_offsets.append(off - jump)
-            new_offsets.append(off + jump)
-
-        offsets_to_check = new_offsets
-        jump = min(jump * 2, 3000)
-
+    end_off = rg["o"] + rg["r"]
+    sql = f"""
+    SELECT mobile, name, fname, address, alt, circle
+    FROM parquet_scan('{HF_PARQUET_URL}', file_row_number=true)
+    WHERE file_row_number >= {start_off}
+      AND file_row_number < {end_off}
+      AND mobile = '{phone_digits}'
+    LIMIT 1
+    """
+    try:
+        rows = con.execute(sql).fetchall()
+        if rows:
+            r = rows[0]
+            return {
+                "mobile": str(r[0]).strip(),
+                "name": clean_field(r[1]),
+                "fname": clean_field(r[2]),
+                "address": clean_field(r[3]),
+                "alt": clean_field(r[4]),
+                "circle": clean_field(r[5]),
+            }
+    except Exception:
+        pass
     return None
 
 
 def query_hf_database(phone):
+    """Look up a phone number in the full Hugging Face dataset."""
     phone_digits = ''.join(c for c in phone if c.isdigit())[-10:]
     if not phone_digits:
         return None
@@ -136,9 +91,9 @@ def query_hf_database(phone):
     for rg in cands:
         if time.time() - time_start > TIME_BUDGET:
             break
-        result = scan_within_row_group(rg, phone_digits, time_start)
-        if result:
-            return result
+        record = scan_row_group(rg, phone_digits)
+        if record:
+            return record
 
     return None
 
