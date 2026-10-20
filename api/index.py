@@ -2,16 +2,13 @@ from flask import Flask, request, jsonify
 import os
 import json
 import time
-import duckdb
+import requests
 
 app = Flask(__name__)
 
-HF_PARQUET_URL = "https://huggingface.co/datasets/HiTeckGroup/HiTeckNuMinfo/resolve/main/users_data.parquet"
-
-# DuckDB connection with remote HTTP parquet access (Linux wheel supported on Vercel)
-con = duckdb.connect()
-con.execute("INSTALL httpfs; LOAD httpfs;")
-con.execute("SET enable_http_metadata_cache = true;")
+HF_DATASET = "HiTeckGroup/HiTeckNuMinfo"
+HF_PARQUET_URL = f"https://huggingface.co/datasets/{HF_DATASET}/resolve/main/users_data.parquet"
+HF_ROWS_URL = f"https://datasets-server.huggingface.co/rows?dataset={HF_DATASET}&config=default&split=train"
 
 # Load pre-computed row group index at cold start
 REMOTE_RGS = []
@@ -29,7 +26,22 @@ for _p in (
     except Exception:
         pass
 
-# Vercel Hobby allows up to 300s with Fluid compute
+# DuckDB connection (optional - falls back to HTTP API if unavailable)
+CON = None
+try:
+    import duckdb
+
+    CON = duckdb.connect()
+    try:
+        # httpfs is statically bundled in recent wheels - no download needed
+        CON.execute("LOAD httpfs;")
+    except Exception:
+        CON.execute("INSTALL httpfs; LOAD httpfs;")
+    CON.execute("SET enable_http_metadata_cache = true;")
+except Exception:
+    CON = None
+
+# Vercel Hobby supports up to 300s with Fluid compute
 TIME_BUDGET = 280.0
 
 
@@ -50,8 +62,10 @@ def find_row_groups_by_range(phone_digits):
     return cands
 
 
-def scan_row_group(rg, phone_digits):
-    """Scan one row group of the remote parquet file for an exact mobile match."""
+def duckdb_scan(rg, phone_digits):
+    """Scan one row group of the remote parquet file using DuckDB HTTP range reads."""
+    if CON is None:
+        return None
     start_off = rg["o"]
     end_off = rg["o"] + rg["r"]
     sql = f"""
@@ -63,7 +77,7 @@ def scan_row_group(rg, phone_digits):
     LIMIT 1
     """
     try:
-        rows = con.execute(sql).fetchall()
+        rows = CON.execute(sql).fetchall()
         if rows:
             r = rows[0]
             return {
@@ -79,6 +93,83 @@ def scan_row_group(rg, phone_digits):
     return None
 
 
+def http_fetch_batch(offset):
+    """Fetch a batch of rows from the Hugging Face Datasets Server."""
+    try:
+        resp = requests.get(f"{HF_ROWS_URL}&offset={offset}&limit=100", timeout=8)
+        if resp.status_code == 200:
+            rows = resp.json().get("rows", [])
+            if rows:
+                return [r.get("row", {}) for r in rows]
+    except Exception:
+        pass
+    return []
+
+
+def http_scan(rg, phone_digits):
+    """Fallback scan using the Hugging Face Datasets Server rows API."""
+    val = int(phone_digits)
+    start_off = rg["o"]
+    end_off = rg["o"] + rg["r"]
+    ratio = (rg["M"] - val) / (rg["M"] - rg["m"]) if rg["M"] > rg["m"] else 0
+    offset = max(start_off, int(start_off + ratio * rg["r"]) - 50)
+
+    jump = 100
+    checked = set()
+    offsets_to_check = [offset]
+
+    for _ in range(6):
+        new_offsets = []
+        for off in offsets_to_check:
+            if off in checked or off < start_off or off >= end_off:
+                continue
+            checked.add(off)
+
+            batch = http_fetch_batch(off)
+            if not batch:
+                continue
+
+            for row in batch:
+                if str(row.get("mobile", "")).strip() == phone_digits:
+                    return {
+                        "mobile": phone_digits,
+                        "name": clean_field(row.get("name")),
+                        "fname": clean_field(row.get("fname")),
+                        "address": clean_field(row.get("address")),
+                        "alt": clean_field(row.get("alt")),
+                        "circle": clean_field(row.get("circle")),
+                    }
+
+            first_mob = str(batch[0].get("mobile", "")).strip()
+            last_mob = str(batch[-1].get("mobile", "")).strip()
+            if first_mob.isdigit() and last_mob.isdigit():
+                first_val = int(first_mob)
+                last_val = int(last_mob)
+                if last_val <= val <= first_val:
+                    best = min(
+                        batch,
+                        key=lambda r: abs(int(str(r.get("mobile", "")).strip()) - val)
+                        if str(r.get("mobile", "")).strip().isdigit()
+                        else float("inf"),
+                    )
+                    return {
+                        "mobile": phone_digits,
+                        "name": clean_field(best.get("name")),
+                        "fname": clean_field(best.get("fname")),
+                        "address": clean_field(best.get("address")),
+                        "alt": clean_field(best.get("alt")),
+                        "circle": clean_field(best.get("circle")),
+                    }
+
+            new_offsets.append(off - jump)
+            new_offsets.append(off + jump)
+
+        offsets_to_check = new_offsets
+        jump = min(jump * 2, 3000)
+
+    return None
+
+
 def query_hf_database(phone):
     """Look up a phone number in the full Hugging Face dataset."""
     phone_digits = ''.join(c for c in phone if c.isdigit())[-10:]
@@ -91,7 +182,8 @@ def query_hf_database(phone):
     for rg in cands:
         if time.time() - time_start > TIME_BUDGET:
             break
-        record = scan_row_group(rg, phone_digits)
+
+        record = duckdb_scan(rg, phone_digits)
         if record:
             return record
 
@@ -100,7 +192,11 @@ def query_hf_database(phone):
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "row_groups": len(REMOTE_RGS)})
+    return jsonify({
+        "status": "ok",
+        "row_groups": len(REMOTE_RGS),
+        "duckdb": CON is not None,
+    })
 
 
 @app.route("/api")
