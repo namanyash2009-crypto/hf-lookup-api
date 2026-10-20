@@ -34,19 +34,30 @@ try:
     import duckdb
 
     CON = duckdb.connect()
-    # Vercel's filesystem is read-only except /tmp - point extensions there
-    _extdir = os.path.join(os.environ.get("TMPDIR", "/tmp"), "duckdb_ext")
+
+    # Vercel has no HOME env var - DuckDB needs home_directory + extension_directory
+    # pointed at a writable location (/tmp) to install/load the httpfs extension.
+    _tmp = os.environ.get("TMPDIR", "/tmp")
+    try:
+        os.makedirs(_tmp, exist_ok=True)
+        CON.execute(f"SET home_directory='{_tmp}';")
+    except Exception:
+        pass
+
+    _extdir = os.path.join(_tmp, "duckdb_ext")
     try:
         os.makedirs(_extdir, exist_ok=True)
         CON.execute(f"SET extension_directory='{_extdir}';")
     except Exception:
         pass
+
     try:
         CON.execute("LOAD httpfs;")
     except Exception:
-        # httpfs must be downloaded to a writable extension directory
+        # httpfs is not bundled in the pip wheel - download it once into /tmp
         CON.execute("INSTALL httpfs;")
         CON.execute("LOAD httpfs;")
+
     CON.execute("SET enable_http_metadata_cache = true;")
 except Exception as _e:
     CON = None
