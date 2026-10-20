@@ -1,7 +1,11 @@
 {
   "version": 2,
   "builds": [
-    { "src": "api/index.py", "use": "@vercel/python" }
+    {
+      "src": "api/index.py",
+      "use": "@vercel/python",
+      "includeFiles": ["api/rg_index.json", "rg_index.json"]
+    }
   ],
   "routes": [
     { "src": "/(.*)", "dest": "/api/index.py" }
