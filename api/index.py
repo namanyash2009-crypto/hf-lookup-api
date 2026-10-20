@@ -67,13 +67,22 @@ except Exception as _e:
 LAST_ERROR = None
 
 # Vercel Hobby supports up to 300s with Fluid compute
-TIME_BUDGET = 280.0
+TIME_BUDGET = 270.0
+
+# Maximum number of linked records to trace (main number + 4 alt hops)
+MAX_STEPS = 5
+
+EMPTY_VALUES = {"null", "none", "", "nulllll", "-", "0", "na", "n/a", "nil", "undefined"}
 
 
 def clean_field(value):
-    if not value or str(value).strip().lower() in ["null", "none", "", "nulllll", "-", "0", "na", "n/a"]:
+    """Normalise a dataset value - returns None for empty/placeholder values."""
+    if value is None:
         return None
-    return str(value).strip()
+    s = str(value).strip()
+    if s.lower() in EMPTY_VALUES:
+        return None
+    return s
 
 
 def find_row_groups_by_range(phone_digits):
@@ -85,6 +94,18 @@ def find_row_groups_by_range(phone_digits):
     else:
         cands.sort(key=lambda r: r["M"] - r["m"])
     return cands
+
+
+def build_record(row):
+    """Build a full profile record from a raw dataset row."""
+    return {
+        "mobile": clean_field(row[0]),
+        "name": clean_field(row[1]),
+        "fname": clean_field(row[2]),
+        "address": clean_field(row[3]),
+        "alt": clean_field(row[4]),
+        "circle": clean_field(row[5]),
+    }
 
 
 def duckdb_scan(rg, phone_digits):
@@ -104,15 +125,7 @@ def duckdb_scan(rg, phone_digits):
     try:
         rows = CON.execute(sql).fetchall()
         if rows:
-            r = rows[0]
-            return {
-                "mobile": str(r[0]).strip(),
-                "name": clean_field(r[1]),
-                "fname": clean_field(r[2]),
-                "address": clean_field(r[3]),
-                "alt": clean_field(r[4]),
-                "circle": clean_field(r[5]),
-            }
+            return build_record(rows[0])
     except Exception as _e:
         global LAST_ERROR
         LAST_ERROR = f"{type(_e).__name__}: {_e}"
@@ -139,13 +152,10 @@ def http_scan(rg, phone_digits):
     end_off = rg["o"] + rg["r"]
     ratio = (rg["M"] - val) / (rg["M"] - rg["m"]) if rg["M"] > rg["m"] else 0
     base = max(start_off, int(start_off + ratio * rg["r"]) - 3000)
-
-    # Scan a wide window of batches in parallel around the interpolated offset
     offsets = list(range(base, min(base + 12000, end_off), 100))
 
     def check(off):
-        batch = http_fetch_batch(off)
-        for row in batch:
+        for row in http_fetch_batch(off):
             if str(row.get("mobile", "")).strip() == phone_digits:
                 return {
                     "mobile": phone_digits,
@@ -177,7 +187,6 @@ def query_hf_database(phone):
     for rg in cands:
         if time.time() - time_start > TIME_BUDGET:
             break
-
         record = duckdb_scan(rg, phone_digits)
         if record:
             return record
@@ -205,31 +214,6 @@ def health():
     })
 
 
-@app.route("/diag")
-def diag():
-    """Diagnostic: run one real query and report timing/errors."""
-    t0 = time.time()
-    sql = (
-        "SELECT mobile, name FROM parquet_scan('" + HF_PARQUET_URL + "', file_row_number=true) "
-        "WHERE file_row_number >= 233228287 AND file_row_number < 233351167 "
-        "AND mobile = '8168781901' LIMIT 1"
-    )
-    try:
-        rows = CON.execute(sql).fetchall() if CON else None
-        return jsonify({
-            "ok": True,
-            "seconds": round(time.time() - t0, 2),
-            "rows": rows,
-            "last_query_error": LAST_ERROR,
-        })
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "seconds": round(time.time() - t0, 2),
-            "error": f"{type(e).__name__}: {e}",
-        }), 500
-
-
 @app.route("/api")
 def api():
     phone = request.args.get("phone")
@@ -242,9 +226,12 @@ def api():
 
     history_chain = []
     seen_numbers = set()
+    time_start = time.time()
 
-    for step in range(1, 4):
+    for step in range(1, MAX_STEPS + 1):
         if not current_lookup or current_lookup in seen_numbers:
+            break
+        if time.time() - time_start > TIME_BUDGET:
             break
 
         seen_numbers.add(current_lookup)
@@ -258,15 +245,23 @@ def api():
             "step": step,
             "queried_number": current_lookup,
             "profile": {
+                "mobile": record.get("mobile"),
                 "name": record.get("name"),
                 "fname": record.get("fname"),
-                "mobile": record.get("mobile"),
+                "address": record.get("address"),
                 "alt": record.get("alt"),
                 "circle": record.get("circle"),
-                "address": record.get("address"),
             },
         })
-        current_lookup = record.get("alt")
+
+        # Follow the alt number - stop if it loops back to a number already seen
+        next_lookup = record.get("alt")
+        if not next_lookup:
+            break
+        next_digits = ''.join(c for c in str(next_lookup) if c.isdigit())[-10:]
+        if not next_digits or next_digits in seen_numbers:
+            break
+        current_lookup = next_digits
 
     return jsonify({
         "requested_phone": phone,
