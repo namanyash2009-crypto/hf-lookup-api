@@ -73,7 +73,7 @@ TIME_BUDGET = 280.0
 def clean_field(value):
     if not value or str(value).strip().lower() in ["null", "none", "", "nulllll", "-", "0", "na", "n/a"]:
         return None
-    return str(value).trim()
+    return str(value).strip()
 
 
 def find_row_groups_by_range(phone_digits):
