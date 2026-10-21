@@ -36,8 +36,9 @@ REMOTE_URL = "https://huggingface.co/datasets/HiTeckGroup/HiTeckNuMinfo/resolve/
 # column/offset indexes occupy about 789 MB of the tail.
 CACHE_BYTES = int(os.environ.get("HF_PARQUET_CACHE_BYTES", 900 * 1024 * 1024))
 
-# In-memory budget for cached blocks.
-MEM_CACHE_BYTES = int(os.environ.get("HF_PARQUET_MEM_CACHE_BYTES", 320 * 1024 * 1024))
+# In-memory budget for cached blocks.  Kept modest: a serverless function
+# has a hard memory limit and the proxy shares it with DuckDB.
+MEM_CACHE_BYTES = int(os.environ.get("HF_PARQUET_MEM_CACHE_BYTES", 96 * 1024 * 1024))
 
 CACHE_DIR = os.path.join(os.environ.get("TMPDIR", "/tmp"), "hf_parquet_cache")
 CACHE_PATH = os.path.join(CACHE_DIR, "tail.bin")

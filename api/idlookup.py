@@ -9,15 +9,20 @@ That is still far cheaper than reading the whole file: the id column is about
 9% of the 93 GB parquet (8.7 GB compressed), and a scan that projects just
 `id` touches only those bytes.
 
-The scan is split into windows of row groups and all windows are submitted at
-once to a pool of workers, so the whole file is covered at the maximum
-bandwidth the connection can sustain.  The first window that finds the id
-wins and the rest stop as soon as they notice.
+The scan is split into windows of row groups, and the windows are handed to
+a pool of workers so the whole file is covered at the maximum bandwidth the
+connection can sustain.  The first window that finds the id wins and the
+rest stop as soon as they notice.
 
-Every worker uses its own DuckDB connection - a connection is not safe to
-use from two threads at once - and all byte-range traffic goes through the
-local Range proxy, so the parquet metadata is fetched once (it is cached on
-disk) and upstream 429 throttling is retried.
+All workers share ONE DuckDB connection and take a cursor from it.  That
+matters a lot: the parquet footer of this dataset is 827 MB of thrift
+metadata, and a separate connection per worker would parse it once per
+worker and exhaust the function's memory.  Cursors share the database
+instance, so the footer is parsed exactly once.
+
+All byte-range traffic goes through the local Range proxy, so the parquet
+metadata is fetched once (it is cached on disk) and upstream 429 throttling
+is retried.
 """
 
 import os
@@ -30,12 +35,12 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 WINDOW_RGS = 30
 
 # Windows scanned concurrently.  This is what saturates the link: the id
-# column is read in large chunks, so the number of parallel readers is what
-# decides how fast the scan runs.
-CONCURRENT_WINDOWS = 24
+# column is read in large chunks, so the number of parallel readers decides
+# how fast the scan runs.
+CONCURRENT_WINDOWS = 8
 
 # DuckDB threads used inside a window.
-SCAN_THREADS = 4
+SCAN_THREADS = 2
 
 
 def _sql_literal(value):
@@ -44,7 +49,7 @@ def _sql_literal(value):
 
 
 def _make_scan_connection(url):
-    """Create a DuckDB connection dedicated to id scans."""
+    """Create the DuckDB connection used for id scans."""
     import duckdb
 
     conn = duckdb.connect()
@@ -84,16 +89,17 @@ class IdScanner:
     def __init__(self, url, row_groups):
         self.url = url
         self.row_groups = row_groups or []
-        self._local = threading.local()
+        self._conn = None
+        self._conn_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=CONCURRENT_WINDOWS)
 
     def _connection(self):
-        """Return this thread's DuckDB connection, creating it on first use."""
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
-            conn = _make_scan_connection(self.url)
-            self._local.conn = conn
-        return conn
+        """Return the shared DuckDB connection, creating it on first use."""
+        if self._conn is None:
+            with self._conn_lock:
+                if self._conn is None:
+                    self._conn = _make_scan_connection(self.url)
+        return self._conn
 
     def _windows(self):
         """Contiguous row-number windows covering the whole file."""
@@ -135,14 +141,23 @@ class IdScanner:
           AND {condition}
         LIMIT 8
         """
+        cursor = None
         try:
-            conn = self._connection()
-            rows = conn.execute(sql).fetchall()
+            # A cursor is a separate connection to the same database, so the
+            # parquet metadata is parsed once and shared by all workers.
+            cursor = self._connection().cursor()
+            rows = cursor.execute(sql).fetchall()
             if rows:
                 stop.set()
             return [r[0] for r in rows]
         except Exception:
             return []
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
 
     def find(self, id_value, time_budget=240.0):
         """Return (row_number, complete).
