@@ -747,6 +747,21 @@ def health():
     })
 
 
+@app.route("/")
+def index():
+    return jsonify({
+        "service": "Hugging Face dataset lookup API",
+        "endpoints": {
+            "phone": "/api?phone=9876543210",
+            "vehicle": "/api?vehical=MH12DE1433",
+            "license": "/api?license=DL0420110149646",
+            "ifsc": "/api?ifsc=SBIN0000001",
+        },
+        "health": "/health",
+        "meta": _build_meta(cached=False, cache_hits=CACHE_HITS, latency_ms=0),
+    })
+
+
 @app.route("/api")
 def api():
     # Vehicle / license / IFSC lookups are handled by the parivahan module.
