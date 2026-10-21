@@ -28,6 +28,23 @@ for _p in (
     except Exception:
         pass
 
+# Optional accurate index: adds the true first-row (highest) value of every
+# row group, which lets us rank candidates far more precisely.
+ACC_RGS = []
+for _p in (
+    os.path.join(os.path.dirname(__file__), "acc_index.json"),
+    os.path.join(os.path.dirname(__file__), "..", "acc_index.json"),
+    "/var/task/acc_index.json",
+    os.path.join(os.getcwd(), "acc_index.json"),
+):
+    try:
+        if os.path.isfile(_p):
+            with open(_p, "r", encoding="utf-8") as f:
+                ACC_RGS = json.load(f)
+            break
+    except Exception:
+        pass
+
 # DuckDB connection (optional - HTTP fallback used if unavailable)
 CON = None
 DUCKDB_ERROR = None
@@ -178,6 +195,28 @@ def find_row_groups_by_range(phone_digits):
     first, since the true owner is almost always among the tightest.
     """
     val = int(phone_digits)
+
+    if ACC_RGS:
+        # Accurate index available: use the true first-row value of each row
+        # group, which brackets the number much more precisely.
+        hits = []
+        for r in ACC_RGS:
+            lo = r["m"]
+            hi = r["f"]
+            if lo > hi:
+                lo, hi = hi, lo
+            if lo <= val <= hi:
+                hits.append((hi - lo, abs((lo + hi) // 2 - val), r))
+        if hits:
+            hits.sort(key=lambda t: (t[0], t[1]))
+            return [h[2] for h in hits]
+        # Number not claimed by any row group - use the closest ones.
+        closest = sorted(
+            ACC_RGS,
+            key=lambda r: min(abs(r["m"] - val), abs(r["f"] - val)),
+        )[:8]
+        return closest
+
     cands = [r for r in REMOTE_RGS if r["m"] <= val <= r["M"]]
     if not cands:
         # No row group claims it - use the numerically closest ones

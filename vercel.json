@@ -2,7 +2,7 @@
   "version": 2,
   "functions": {
     "api/index.py": {
-      "includeFiles": "api/rg_index.json",
+      "includeFiles": "api/{rg_index.json,acc_index.json}",
       "maxDuration": 300
     }
   },
