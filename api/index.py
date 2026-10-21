@@ -28,6 +28,27 @@ HF_DATASET = "HiTeckGroup/HiTeckNuMinfo"
 HF_PARQUET_URL = f"https://huggingface.co/datasets/{HF_DATASET}/resolve/main/users_data.parquet"
 HF_ROWS_URL = f"https://datasets-server.huggingface.co/rows?dataset={HF_DATASET}&config=default&split=train"
 
+
+def _start_local_proxy():
+    """Serve the remote parquet through a local Range proxy with a cached footer.
+
+    The parquet footer is ~16 MB and costs about 7s to fetch, but it never
+    changes. Caching it on disk and serving it locally removes that cost
+    from every request on a warm container.
+    """
+    try:
+        from api.proxy import start_proxy
+
+        return start_proxy()
+    except Exception:
+        return None
+
+
+# Prefer the local proxy URL when it is available.
+PROXY_URL = _start_local_proxy()
+if PROXY_URL:
+    HF_PARQUET_URL = PROXY_URL
+
 # Load pre-computed row group index at cold start
 REMOTE_RGS = []
 for _p in (
@@ -57,6 +78,23 @@ for _p in (
         if os.path.isfile(_p):
             with open(_p, "r", encoding="utf-8") as f:
                 ACC_RGS = json.load(f)
+            break
+    except Exception:
+        pass
+
+# Optional fine index: 16 sample points inside every row group, which allows
+# pinpointing the exact segment a number falls into.
+FINE_RGS = []
+for _p in (
+    os.path.join(os.path.dirname(__file__), "fine_index.json"),
+    os.path.join(os.path.dirname(__file__), "..", "fine_index.json"),
+    "/var/task/fine_index.json",
+    os.path.join(os.getcwd(), "fine_index.json"),
+):
+    try:
+        if os.path.isfile(_p):
+            with open(_p, "r", encoding="utf-8") as f:
+                FINE_RGS = json.load(f)
             break
     except Exception:
         pass
@@ -145,9 +183,20 @@ def _warmup_metadata():
         pass
 
 
+def _warmup_footer_cache():
+    """Download the parquet footer to the local disk cache in the background."""
+    try:
+        from api.proxy import _ensure_footer
+
+        _ensure_footer()
+    except Exception:
+        pass
+
+
 if DUCKDB_AVAILABLE:
     try:
         threading.Thread(target=_warmup_metadata, daemon=True).start()
+        threading.Thread(target=_warmup_footer_cache, daemon=True).start()
     except Exception:
         pass
 
@@ -223,51 +272,114 @@ def clean_field(value):
     return s
 
 
-# Build descending chunks (independent sorted runs) from the row-group index.
-# Each chunk is a monotonic run, so a value can be located by binary search.
+# Build descending chunks (independent sorted runs). The accurate index gives
+# the true first-row value of every row group, so the chunk boundaries are
+# reliable; the parquet statistics alone are stale for about 11% of them.
 CHUNKS = []
-_start = 0
-for _i in range(1, len(REMOTE_RGS)):
-    if REMOTE_RGS[_i]["m"] > REMOTE_RGS[_i - 1]["m"]:
-        CHUNKS.append((_start, _i - 1))
-        _start = _i
-if REMOTE_RGS:
-    CHUNKS.append((_start, len(REMOTE_RGS) - 1))
+if ACC_RGS:
+    _start = 0
+    for _i in range(1, len(ACC_RGS)):
+        if ACC_RGS[_i]["f"] > ACC_RGS[_i - 1]["f"]:
+            CHUNKS.append((_start, _i - 1))
+            _start = _i
+    CHUNKS.append((_start, len(ACC_RGS) - 1))
+else:
+    _start = 0
+    for _i in range(1, len(REMOTE_RGS)):
+        if REMOTE_RGS[_i]["m"] > REMOTE_RGS[_i - 1]["m"]:
+            CHUNKS.append((_start, _i - 1))
+            _start = _i
+    if REMOTE_RGS:
+        CHUNKS.append((_start, len(REMOTE_RGS) - 1))
+
+
+def _order_by_span(val):
+    """Rank row groups by how tightly their range brackets the number."""
+    hits = []
+    for i, r in enumerate(ACC_RGS):
+        lo, hi = min(r["m"], r["f"]), max(r["m"], r["f"])
+        if lo <= val <= hi:
+            hits.append((hi - lo, abs((lo + hi) // 2 - val), i))
+    hits.sort()
+    return [h[2] for h in hits]
+
+
+def _order_by_chunk(val):
+    """Rank row groups by binary-searching the descending chunks.
+
+    Each chunk is a monotonic run of row groups, so the number's position
+    inside the dataset can be narrowed down with a binary search.
+    """
+    results = []
+    for cs, ce in CHUNKS:
+        if not (ACC_RGS[ce]["f"] <= val <= ACC_RGS[cs]["f"]):
+            continue
+        lo, hi = cs, ce
+        pos = cs
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            r = ACC_RGS[mid]
+            rlo, rhi = min(r["m"], r["f"]), max(r["m"], r["f"])
+            if val > rhi:
+                hi = mid - 1
+            elif val < rlo:
+                lo = mid + 1
+            else:
+                pos = mid
+                break
+        for d in (-1, 0, 1):
+            i = pos + d
+            if cs <= i <= ce:
+                r = ACC_RGS[i]
+                rlo, rhi = min(r["m"], r["f"]), max(r["m"], r["f"])
+                if rlo <= val <= rhi:
+                    results.append(i)
+    return results
 
 
 def find_row_groups_by_range(phone_digits):
     """Locate candidate row groups for a phone number.
 
-    The dataset is a set of independent descending runs ("chunks"). Parquet
-    statistics are approximate, so several row groups can claim the same
-    number. Row groups whose range tightly brackets the number are tried
-    first, since the true owner is almost always among the tightest.
+    Parquet statistics are approximate, so several row groups can claim the
+    same number. Two independent rankings are merged: one by bracket
+    tightness and one by binary-searching the descending chunks. Together
+    they put the true owner in the first couple of candidates.
     """
     val = int(phone_digits)
 
-    if ACC_RGS:
-        # Accurate index available: use the true first-row value of each row
-        # group, which brackets the number much more precisely.
+    if FINE_RGS:
+        # Fine index: sample points inside each row group pinpoint the exact
+        # segment a number falls into, so the true owner is almost always
+        # the first candidate.
         hits = []
-        fallback = []
-        for r in ACC_RGS:
-            lo, hi = min(r["m"], r["f"]), max(r["m"], r["f"])
-            if lo <= val <= hi:
-                hits.append((hi - lo, abs((lo + hi) // 2 - val), r))
-            elif r["m"] <= val <= r["M"]:
-                # Parquet statistics can be stale for some row groups; keep
-                # these as a lower-priority fallback.
-                fallback.append((r["M"] - r["m"], abs((r["m"] + r["M"]) // 2 - val), r))
+        for r in FINE_RGS:
+            pts = r.get("s") or []
+            if len(pts) < 2:
+                continue
+            vals = [p[1] for p in pts]
+            lo, hi = min(vals), max(vals)
+            if not (lo <= val <= hi):
+                continue
+            # Prefer the row group whose samples bracket the number most tightly
+            hits.append((hi - lo, abs((lo + hi) // 2 - val), r))
         if hits:
             hits.sort(key=lambda t: (t[0], t[1]))
-            ordered = [h[2] for h in hits]
-            if fallback:
-                fallback.sort(key=lambda t: (t[0], t[1]))
-                ordered += [f[2] for f in fallback]
-            return ordered
-        if fallback:
-            fallback.sort(key=lambda t: (t[0], t[1]))
-            return [f[2] for f in fallback]
+            return [h[2] for h in hits]
+
+    if ACC_RGS:
+        # Merge the two rankings so the true owner lands near the front.
+        a = _order_by_span(val)[:12]
+        b = _order_by_chunk(val)[:12]
+        merged = []
+        seen = set()
+        for i in range(max(len(a), len(b))):
+            for src in (a, b):
+                if i < len(src) and src[i] not in seen:
+                    seen.add(src[i])
+                    merged.append(src[i])
+        if merged:
+            return [ACC_RGS[i] for i in merged]
+
         # Number not claimed by any row group - use the closest ones.
         closest = sorted(
             ACC_RGS,
@@ -309,11 +421,32 @@ def duckdb_find_row(rg, phone_digits, conn=None):
     c = conn if conn is not None else CON
     if c is None:
         return None
+
+    # With the fine index we know which segment of the row group the number
+    # lives in, so we only have to scan that slice of rows.
+    lo_off, hi_off = rg["o"], rg["o"] + rg["r"]
+    pts = rg.get("s") if isinstance(rg, dict) else None
+    if pts and len(pts) >= 2:
+        vals = [p[1] for p in pts]
+        seg = None
+        for j in range(len(pts) - 1):
+            a, b = pts[j][1], pts[j + 1][1]
+            if min(a, b) <= int(phone_digits) <= max(a, b):
+                seg = j
+                break
+        if seg is not None:
+            start = pts[seg][0]
+            end = pts[seg + 1][0] if seg + 1 < len(pts) else rg["r"]
+            # Widen slightly - the local ordering is not perfectly sorted
+            pad = (end - start) // 4
+            lo_off = rg["o"] + max(0, start - pad)
+            hi_off = rg["o"] + min(rg["r"], end + pad)
+
     sql = f"""
     SELECT file_row_number
     FROM parquet_scan('{HF_PARQUET_URL}', file_row_number=true)
-    WHERE file_row_number >= {rg["o"]}
-      AND file_row_number < {rg["o"] + rg["r"]}
+    WHERE file_row_number >= {lo_off}
+      AND file_row_number < {hi_off}
       AND mobile = '{phone_digits}'
     LIMIT 1
     """
@@ -332,7 +465,32 @@ def duckdb_find_row(rg, phone_digits, conn=None):
 
 
 def duckdb_fetch_row(row_number, conn=None):
-    """Phase 2: fetch the full record for a known row number."""
+    """Phase 2: fetch the full record for a known row number.
+
+    The Datasets Server /rows endpoint returns every column for a single row
+    in about half a second, which is much faster than pulling the row group
+    column chunks again through DuckDB.
+    """
+    try:
+        resp = requests.get(
+            f"{HF_ROWS_URL}&offset={row_number}&limit=1", timeout=12
+        )
+        if resp.status_code == 200:
+            rows = resp.json().get("rows", [])
+            if rows:
+                r = rows[0].get("row", {})
+                return {
+                    "mobile": clean_field(r.get("mobile")),
+                    "name": clean_field(r.get("name")),
+                    "fname": clean_field(r.get("fname")),
+                    "address": clean_field(r.get("address")),
+                    "alt": clean_field(r.get("alt")),
+                    "circle": clean_field(r.get("circle")),
+                }
+    except Exception:
+        pass
+
+    # Fallback to DuckDB
     c = conn if conn is not None else CON
     if c is None:
         return None
@@ -449,31 +607,38 @@ def query_hf_database(phone):
     time_start = time.time()
     cands = find_row_groups_by_range(phone_digits)
 
-    # Fast path: the tightest-bracketing row group holds the record most of
-    # the time, so try it alone first (one HTTP range read).
-    if cands:
-        record = duckdb_scan(cands[0], phone_digits)
-        if record:
-            _cache_put(phone_digits, record)
-            return record
+    # Fast path: the merged ranking puts the true owner in the first couple
+    # of candidates. Phase 1 reads only the `mobile` column to locate the
+    # row, phase 2 pulls the full record via the Datasets Server.
+    for rg in cands[:3]:
+        if time.time() - time_start > TIME_BUDGET:
+            break
+        row_number = duckdb_find_row(rg, phone_digits)
+        if row_number is not None:
+            record = duckdb_fetch_row(row_number)
+            if record:
+                _cache_put(phone_digits, record)
+                return record
 
     # Wider sweep: locate the row in the remaining candidates concurrently.
     # Phase 1 only reads the `mobile` column (half the bytes of a full scan),
     # phase 2 then pulls the single matching row.
-    if len(cands) > 1 and CON is not None and time.time() - time_start < TIME_BUDGET:
-        record = _parallel_two_phase(cands[1:21], phone_digits, time_start)
+    if len(cands) > 3 and CON is not None and time.time() - time_start < TIME_BUDGET:
+        record = _parallel_two_phase(cands[3:15], phone_digits, time_start)
         if record:
             _cache_put(phone_digits, record)
             return record
 
     # Sequential sweep over any remaining candidates
-    for rg in cands[21:]:
+    for rg in cands[15:]:
         if time.time() - time_start > TIME_BUDGET:
             break
-        record = duckdb_scan(rg, phone_digits)
-        if record:
-            _cache_put(phone_digits, record)
-            return record
+        row_number = duckdb_find_row(rg, phone_digits)
+        if row_number is not None:
+            record = duckdb_fetch_row(row_number)
+            if record:
+                _cache_put(phone_digits, record)
+                return record
 
     # Fallback to HTTP API if DuckDB unavailable
     if CON is None:
@@ -527,7 +692,7 @@ def _parallel_two_phase(row_groups, phone_digits, time_start):
 
     row_number = None
     try:
-        with ThreadPoolExecutor(max_workers=min(len(cursors), 8)) as ex:
+        with ThreadPoolExecutor(max_workers=min(len(cursors), 12)) as ex:
             for res in ex.map(locate, list(zip(cursors, row_groups))):
                 if res is not None:
                     row_number = res
