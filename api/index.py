@@ -177,19 +177,36 @@ def clean_field(value):
     return s
 
 
-def find_row_groups_by_range(phone_digits):
-    """Find candidate row groups whose min/max range contains this number.
+# Build descending chunks (independent sorted runs) from the row-group index.
+# Each chunk is a monotonic run, so a value can be located by binary search.
+CHUNKS = []
+_start = 0
+for _i in range(1, len(REMOTE_RGS)):
+    if REMOTE_RGS[_i]["m"] > REMOTE_RGS[_i - 1]["m"]:
+        CHUNKS.append((_start, _i - 1))
+        _start = _i
+if REMOTE_RGS:
+    CHUNKS.append((_start, len(REMOTE_RGS) - 1))
 
-    Parquet statistics are approximate, so several row groups can claim the same
-    number. We rank by bracket tightness so the true owner is tried first.
+
+def find_row_groups_by_range(phone_digits):
+    """Locate candidate row groups for a phone number.
+
+    The dataset is a set of independent descending runs ("chunks"). Parquet
+    statistics are approximate, so several row groups can claim the same
+    number. Row groups whose range tightly brackets the number are tried
+    first, since the true owner is almost always among the tightest.
     """
     val = int(phone_digits)
     cands = [r for r in REMOTE_RGS if r["m"] <= val <= r["M"]]
     if not cands:
         # No row group claims it - use the numerically closest ones
-        cands = sorted(REMOTE_RGS, key=lambda r: min(abs(r["m"] - val), abs(r["M"] - val)))
+        cands = sorted(
+            REMOTE_RGS,
+            key=lambda r: min(abs(r["m"] - val), abs(r["M"] - val)),
+        )[:8]
     else:
-        # Prefer row groups whose range tightly brackets the number
+        # Tightest bracket first - the true owner is nearly always here
         cands.sort(key=lambda r: (r["M"] - r["m"], abs((r["m"] + r["M"]) // 2 - val)))
     return cands
 
@@ -295,20 +312,27 @@ def query_hf_database(phone):
     time_start = time.time()
     cands = find_row_groups_by_range(phone_digits)
 
-    # Scan the most likely row groups first (sequential, cheapest path)
-    for rg in cands[:4]:
-        if time.time() - time_start > TIME_BUDGET:
-            break
-        record = duckdb_scan(rg, phone_digits)
+    # Fast path: the tightest-bracketing row group holds the record most of
+    # the time, so try it alone first (one HTTP range read).
+    if cands:
+        record = duckdb_scan(cands[0], phone_digits)
         if record:
             _cache_put(phone_digits, record)
             return record
 
-    # Wider sweep: scan remaining candidates in parallel using independent
-    # DuckDB connections so several row groups are probed concurrently.
-    remaining = cands[4:16]
-    if remaining and CON is not None and time.time() - time_start < TIME_BUDGET:
-        record = _parallel_duckdb_scan(remaining, phone_digits, time_start)
+    # Wider sweep: probe the remaining candidates concurrently. Cursors share
+    # one DuckDB instance, so the parquet metadata is fetched only once.
+    if len(cands) > 1 and CON is not None and time.time() - time_start < TIME_BUDGET:
+        record = _parallel_duckdb_scan(cands[1:17], phone_digits, time_start)
+        if record:
+            _cache_put(phone_digits, record)
+            return record
+
+    # Sequential sweep over any remaining candidates
+    for rg in cands[17:]:
+        if time.time() - time_start > TIME_BUDGET:
+            break
+        record = duckdb_scan(rg, phone_digits)
         if record:
             _cache_put(phone_digits, record)
             return record
@@ -335,12 +359,11 @@ def _parallel_duckdb_scan(row_groups, phone_digits, time_start):
     if CON is None:
         return None
 
-    def probe(pair):
-        idx, rg = pair
+    def probe(rg_index):
         try:
             cur = CON.cursor()
             try:
-                return duckdb_scan(rg, phone_digits, cur)
+                return duckdb_scan(rg_index, phone_digits, cur)
             finally:
                 try:
                     cur.close()
@@ -351,7 +374,7 @@ def _parallel_duckdb_scan(row_groups, phone_digits, time_start):
 
     try:
         with ThreadPoolExecutor(max_workers=min(len(row_groups), 8)) as ex:
-            for res in ex.map(probe, list(enumerate(row_groups))):
+            for res in ex.map(probe, row_groups):
                 if res:
                     return res
                 if time.time() - time_start > TIME_BUDGET:
