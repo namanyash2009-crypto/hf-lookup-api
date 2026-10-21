@@ -4,9 +4,25 @@ import json
 import threading
 import time
 import requests
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
+
+CREDITS = "https://t.me/NamanYadavBots"
+
+
+def _build_meta(cached=False, cache_hits=0, latency_ms=0):
+    """Standard meta block attached to every response."""
+    return {
+        "credits": CREDITS,
+        "cached": bool(cached),
+        "cache_hits": int(cache_hits),
+        "latency_ms": int(latency_ms),
+        "timestamp": datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z"),
+    }
 
 HF_DATASET = "HiTeckGroup/HiTeckNuMinfo"
 HF_PARQUET_URL = f"https://huggingface.co/datasets/{HF_DATASET}/resolve/main/users_data.parquet"
@@ -556,14 +572,39 @@ def health():
         "cache_size": len(_CACHE),
         "cache_hits": CACHE_HITS,
         "cache_misses": CACHE_MISSES,
+        "endpoints": {
+            "phone": "/api?phone=9876543210",
+            "vehicle": "/api?vehical=MH12DE1433",
+            "license": "/api?license=DL0420110149646",
+            "ifsc": "/api?ifsc=SBIN0000001",
+        },
+        "meta": _build_meta(cached=False, cache_hits=CACHE_HITS, latency_ms=0),
     })
 
 
 @app.route("/api")
 def api():
+    # Vehicle / license / IFSC lookups are handled by the parivahan module.
+    for _param in ("vehical", "vehicle", "license", "ifsc"):
+        if _param in request.args:
+            from api import parivahan
+
+            _status, _body = parivahan.lookup(_param, request.args.get(_param))
+            return jsonify(_body), _status
+
     phone = request.args.get("phone")
     if not phone:
-        return jsonify({"error": "Missing parameter. Correct use example: /api?phone=9876543210"}), 400
+        return jsonify({
+            "success": False,
+            "error": "Missing parameter.",
+            "examples": {
+                "phone": "/api?phone=9876543210",
+                "vehicle": "/api?vehical=MH12DE1433",
+                "license": "/api?license=DL0420110149646",
+                "ifsc": "/api?ifsc=SBIN0000001",
+            },
+            "meta": _build_meta(cached=False, cache_hits=CACHE_HITS, latency_ms=0),
+        }), 400
 
     current_lookup = ''.join(c for c in phone if c.isdigit())[-10:]
     if not current_lookup:
@@ -584,7 +625,15 @@ def api():
         if not record:
             if step == 1:
                 _disk_cache_save()
-                return jsonify({"error": f"Record for {phone} not found in database"}), 404
+                return jsonify({
+                    "success": False,
+                    "error": f"Record for {phone} not found in database",
+                    "meta": _build_meta(
+                        cached=False,
+                        cache_hits=CACHE_HITS,
+                        latency_ms=int((time.time() - time_start) * 1000),
+                    ),
+                }), 404
             break
 
         history_chain.append({
@@ -612,10 +661,41 @@ def api():
     _disk_cache_save()
 
     return jsonify({
+        "success": True,
         "requested_phone": phone,
         "total_chain_steps": len(history_chain),
         "lookup_chain": history_chain,
+        "meta": _build_meta(
+            cached=phone in _CACHE,
+            cache_hits=CACHE_HITS,
+            latency_ms=int((time.time() - time_start) * 1000),
+        ),
     })
+
+
+@app.route("/vehical")
+@app.route("/vehicle")
+def vehicle_route():
+    from api import parivahan
+
+    _status, _body = parivahan.lookup("vehical", request.args.get("vehical"))
+    return jsonify(_body), _status
+
+
+@app.route("/license")
+def license_route():
+    from api import parivahan
+
+    _status, _body = parivahan.lookup("license", request.args.get("license"))
+    return jsonify(_body), _status
+
+
+@app.route("/ifsc")
+def ifsc_route():
+    from api import parivahan
+
+    _status, _body = parivahan.lookup("ifsc", request.args.get("ifsc"))
+    return jsonify(_body), _status
 
 
 if __name__ == "__main__":
