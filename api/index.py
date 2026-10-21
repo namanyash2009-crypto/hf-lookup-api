@@ -203,6 +203,62 @@ def build_record(row):
     }
 
 
+def duckdb_find_row(rg, phone_digits, conn=None):
+    """Phase 1: locate the row number for a number inside a row group.
+
+    Only the `mobile` column is read here, which is roughly twice as fast
+    as pulling every column.
+    """
+    c = conn if conn is not None else CON
+    if c is None:
+        return None
+    sql = f"""
+    SELECT file_row_number
+    FROM parquet_scan('{HF_PARQUET_URL}', file_row_number=true)
+    WHERE file_row_number >= {rg["o"]}
+      AND file_row_number < {rg["o"] + rg["r"]}
+      AND mobile = '{phone_digits}'
+    LIMIT 1
+    """
+    try:
+        if conn is None:
+            with _DUCKDB_LOCK:
+                rows = c.execute(sql).fetchall()
+        else:
+            rows = c.execute(sql).fetchall()
+        if rows:
+            return rows[0][0]
+    except Exception as _e:
+        global LAST_ERROR
+        LAST_ERROR = f"{type(_e).__name__}: {_e}"
+    return None
+
+
+def duckdb_fetch_row(row_number, conn=None):
+    """Phase 2: fetch the full record for a known row number."""
+    c = conn if conn is not None else CON
+    if c is None:
+        return None
+    sql = f"""
+    SELECT mobile, name, fname, address, alt, circle
+    FROM parquet_scan('{HF_PARQUET_URL}', file_row_number=true)
+    WHERE file_row_number = {row_number}
+    LIMIT 1
+    """
+    try:
+        if conn is None:
+            with _DUCKDB_LOCK:
+                rows = c.execute(sql).fetchall()
+        else:
+            rows = c.execute(sql).fetchall()
+        if rows:
+            return build_record(rows[0])
+    except Exception as _e:
+        global LAST_ERROR
+        LAST_ERROR = f"{type(_e).__name__}: {_e}"
+    return None
+
+
 def duckdb_scan(rg, phone_digits, conn=None):
     """Scan one row group of the remote parquet file using DuckDB HTTP range reads."""
     c = conn if conn is not None else CON
@@ -304,16 +360,17 @@ def query_hf_database(phone):
             _cache_put(phone_digits, record)
             return record
 
-    # Wider sweep: probe the remaining candidates concurrently. Cursors share
-    # one DuckDB instance, so the parquet metadata is fetched only once.
+    # Wider sweep: locate the row in the remaining candidates concurrently.
+    # Phase 1 only reads the `mobile` column (half the bytes of a full scan),
+    # phase 2 then pulls the single matching row.
     if len(cands) > 1 and CON is not None and time.time() - time_start < TIME_BUDGET:
-        record = _parallel_duckdb_scan(cands[1:17], phone_digits, time_start)
+        record = _parallel_two_phase(cands[1:21], phone_digits, time_start)
         if record:
             _cache_put(phone_digits, record)
             return record
 
     # Sequential sweep over any remaining candidates
-    for rg in cands[17:]:
+    for rg in cands[21:]:
         if time.time() - time_start > TIME_BUDGET:
             break
         record = duckdb_scan(rg, phone_digits)
@@ -334,11 +391,15 @@ def query_hf_database(phone):
     return None
 
 
-def _parallel_duckdb_scan(row_groups, phone_digits, time_start):
-    """Probe several row groups concurrently using cursors on the shared connection.
+def _parallel_two_phase(row_groups, phone_digits, time_start):
+    """Locate a row across several row groups concurrently, then fetch it.
+
+    Phase 1 reads only the `mobile` column of each row group to locate the
+    matching row number - that is about half the bytes of a full scan.
+    Phase 2 then pulls the single matching row with every column.
 
     Cursors are separate connections to the same DuckDB database, so the
-    parquet metadata is downloaded only once and each thread has its own
+    parquet metadata is downloaded only once and each thread gets its own
     connection to work with.
     """
     if CON is None:
@@ -360,18 +421,20 @@ def _parallel_duckdb_scan(row_groups, phone_digits, time_start):
     if not cursors:
         return None
 
-    def probe(pair):
+    def locate(pair):
         cur, rg = pair
         try:
-            return duckdb_scan(rg, phone_digits, cur)
+            return duckdb_find_row(rg, phone_digits, cur)
         except Exception:
             return None
 
+    row_number = None
     try:
         with ThreadPoolExecutor(max_workers=min(len(cursors), 8)) as ex:
-            for res in ex.map(probe, list(zip(cursors, row_groups))):
-                if res:
-                    return res
+            for res in ex.map(locate, list(zip(cursors, row_groups))):
+                if res is not None:
+                    row_number = res
+                    break
                 if time.time() - time_start > TIME_BUDGET:
                     break
     except Exception:
@@ -382,7 +445,23 @@ def _parallel_duckdb_scan(row_groups, phone_digits, time_start):
                 cur.close()
             except Exception:
                 pass
-    return None
+
+    if row_number is None:
+        return None
+
+    # Phase 2: fetch the full record for the row we located.
+    try:
+        with _DUCKDB_LOCK:
+            cur = CON.cursor()
+        try:
+            return duckdb_fetch_row(row_number, cur)
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+    except Exception:
+        return None
 
 
 @app.route("/health")
