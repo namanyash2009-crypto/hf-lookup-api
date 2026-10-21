@@ -102,6 +102,39 @@ LAST_ERROR = None
 # database, so the parquet metadata cache is still shared).
 _DUCKDB_LOCK = threading.RLock()
 
+
+def _warmup_metadata():
+    """Prefetch the remote parquet footer in the background.
+
+    The footer is ~16 MB and costs about 7s to download on a cold container.
+    Fetching it on a background thread means the first live request does not
+    have to pay that cost - by the time it arrives the cache is already warm.
+    """
+    if CON is None:
+        return
+    try:
+        with _DUCKDB_LOCK:
+            cur = CON.cursor()
+        try:
+            cur.execute(
+                "SELECT count(*) FROM parquet_metadata('" + HF_PARQUET_URL + "') "
+                "WHERE path_in_schema = 'mobile'"
+            ).fetchall()
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+if DUCKDB_AVAILABLE:
+    try:
+        threading.Thread(target=_warmup_metadata, daemon=True).start()
+    except Exception:
+        pass
+
 # Vercel Hobby supports up to 300s with Fluid compute
 TIME_BUDGET = 270.0
 
