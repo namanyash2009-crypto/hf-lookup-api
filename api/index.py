@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import os
 import json
+import threading
 import time
 import requests
 from concurrent.futures import ThreadPoolExecutor
@@ -79,31 +80,10 @@ except Exception as _e:
 
 LAST_ERROR = None
 
-
-def _warmup_duckdb():
-    """Prefetch the remote parquet metadata in the background.
-
-    The parquet footer is ~16 MB; fetching it costs ~13s on a cold container.
-    Doing it in a background thread means the first API request does not have
-    to pay that cost synchronously.
-    """
-    if CON is None:
-        return
-    try:
-        CON.execute(
-            "SELECT count(*) FROM parquet_metadata('" + HF_PARQUET_URL + "') WHERE path_in_schema = 'mobile'"
-        ).fetchall()
-    except Exception:
-        pass
-
-
-if DUCKDB_AVAILABLE:
-    try:
-        import threading
-
-        threading.Thread(target=_warmup_duckdb, daemon=True).start()
-    except Exception:
-        pass
+# A DuckDB connection is not safe to use from two threads at once. Every
+# query therefore runs on its own cursor (a separate connection to the same
+# database, so the parquet metadata cache is still shared).
+_DUCKDB_LOCK = threading.RLock()
 
 # Vercel Hobby supports up to 300s with Fluid compute
 TIME_BUDGET = 270.0
@@ -239,7 +219,11 @@ def duckdb_scan(rg, phone_digits, conn=None):
     LIMIT 1
     """
     try:
-        rows = c.execute(sql).fetchall()
+        if conn is None:
+            with _DUCKDB_LOCK:
+                rows = c.execute(sql).fetchall()
+        else:
+            rows = c.execute(sql).fetchall()
         if rows:
             return build_record(rows[0])
     except Exception as _e:
@@ -353,34 +337,51 @@ def query_hf_database(phone):
 def _parallel_duckdb_scan(row_groups, phone_digits, time_start):
     """Probe several row groups concurrently using cursors on the shared connection.
 
-    Cursors share the same DuckDB instance, so the parquet metadata is fetched
-    only once - separate connections would each re-download it.
+    Cursors are separate connections to the same DuckDB database, so the
+    parquet metadata is downloaded only once and each thread has its own
+    connection to work with.
     """
     if CON is None:
         return None
 
-    def probe(rg_index):
-        try:
-            cur = CON.cursor()
-            try:
-                return duckdb_scan(rg_index, phone_digits, cur)
-            finally:
+    # Create all cursors up front, under the lock, so the parent connection
+    # is never touched while worker threads are running.
+    cursors = []
+    try:
+        with _DUCKDB_LOCK:
+            for _ in row_groups:
                 try:
-                    cur.close()
+                    cursors.append(CON.cursor())
                 except Exception:
-                    pass
+                    break
+    except Exception:
+        return None
+
+    if not cursors:
+        return None
+
+    def probe(pair):
+        cur, rg = pair
+        try:
+            return duckdb_scan(rg, phone_digits, cur)
         except Exception:
             return None
 
     try:
-        with ThreadPoolExecutor(max_workers=min(len(row_groups), 8)) as ex:
-            for res in ex.map(probe, row_groups):
+        with ThreadPoolExecutor(max_workers=min(len(cursors), 8)) as ex:
+            for res in ex.map(probe, list(zip(cursors, row_groups))):
                 if res:
                     return res
                 if time.time() - time_start > TIME_BUDGET:
                     break
     except Exception:
         pass
+    finally:
+        for cur in cursors:
+            try:
+                cur.close()
+            except Exception:
+                pass
     return None
 
 
