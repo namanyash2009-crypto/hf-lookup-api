@@ -1,39 +1,41 @@
 """Resolve a row by its `id` column value.
 
 The `id` column mixes numeric RC numbers, driving-licence numbers, masked
-values and usernames, and it is not sorted - so row groups cannot be pruned by
-value the way the `mobile` column can.  The only way to resolve an id is to
-read the id column.
+values and usernames, and it is not sorted - so row groups cannot be pruned
+by value the way the `mobile` column can.  The only way to resolve an id is
+to read the id column.
 
 That is still far cheaper than reading the whole file: the id column is about
 9% of the 93 GB parquet (8.7 GB compressed), and a scan that projects just
 `id` touches only those bytes.
 
-The scan is split into windows of row groups and the windows are visited in
-ascending order, a group at a time.  Each group runs its windows in parallel
-and the group stops as soon as it has a hit, which keeps the common case
-(an id that occurs early in the file) fast and the result deterministic.
+The scan is split into windows of row groups and all windows are submitted at
+once to a pool of workers, so the whole file is covered at the maximum
+bandwidth the connection can sustain.  The first window that finds the id
+wins and the rest stop as soon as they notice.
 
 Every worker uses its own DuckDB connection - a connection is not safe to
 use from two threads at once - and all byte-range traffic goes through the
-local Range proxy, so the parquet footer is fetched once (it is cached on
+local Range proxy, so the parquet metadata is fetched once (it is cached on
 disk) and upstream 429 throttling is retried.
 """
 
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 # Row groups per window.  A window of 30 row groups is about 3.7 M rows,
 # roughly 18 MB of compressed id data.
 WINDOW_RGS = 30
 
-# Windows scanned concurrently inside one group.
-GROUP_SIZE = 6
+# Windows scanned concurrently.  This is what saturates the link: the id
+# column is read in large chunks, so the number of parallel readers is what
+# decides how fast the scan runs.
+CONCURRENT_WINDOWS = 24
 
 # DuckDB threads used inside a window.
-SCAN_THREADS = 6
+SCAN_THREADS = 4
 
 
 def _sql_literal(value):
@@ -71,7 +73,7 @@ def _make_scan_connection(url):
         conn.execute("LOAD httpfs;")
 
     conn.execute("SET enable_http_metadata_cache = true;")
-    conn.execute("SET http_timeout = 120000;")
+    conn.execute("SET http_timeout = 60000;")
     conn.execute(f"SET threads = {SCAN_THREADS};")
     return conn
 
@@ -82,9 +84,8 @@ class IdScanner:
     def __init__(self, url, row_groups):
         self.url = url
         self.row_groups = row_groups or []
-        self._conns = []
-        self._conn_lock = threading.Lock()
         self._local = threading.local()
+        self._executor = ThreadPoolExecutor(max_workers=CONCURRENT_WINDOWS)
 
     def _connection(self):
         """Return this thread's DuckDB connection, creating it on first use."""
@@ -92,8 +93,6 @@ class IdScanner:
         if conn is None:
             conn = _make_scan_connection(self.url)
             self._local.conn = conn
-            with self._conn_lock:
-                self._conns.append(conn)
         return conn
 
     def _windows(self):
@@ -109,8 +108,11 @@ class IdScanner:
             windows.append((lo, hi))
         return windows
 
-    def _scan_window(self, window, key, tolerant):
+    def _scan_window(self, window, key, tolerant, stop):
         """Return the matching row numbers inside one window."""
+        if stop.is_set():
+            return []
+
         lo, hi = window
         lit = _sql_literal(key)
         if tolerant:
@@ -135,7 +137,10 @@ class IdScanner:
         """
         try:
             conn = self._connection()
-            return [r[0] for r in conn.execute(sql).fetchall()]
+            rows = conn.execute(sql).fetchall()
+            if rows:
+                stop.set()
+            return [r[0] for r in rows]
         except Exception:
             return []
 
@@ -155,36 +160,39 @@ class IdScanner:
             return None, True
 
         start = time.time()
-        timed_out = False
+        stop = threading.Event()
+        hit = []
 
         for tolerant in (False, True):
-            for g in range(0, len(windows), GROUP_SIZE):
+            pending = {
+                self._executor.submit(self._scan_window, w, key, tolerant, stop): w
+                for w in windows
+            }
+            timed_out = False
+
+            while pending:
+                done, _ = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    try:
+                        hit.extend(fut.result())
+                    except Exception:
+                        pass
+                    pending.pop(fut, None)
+                if hit:
+                    break
                 if time.time() - start > time_budget:
                     timed_out = True
                     break
 
-                group = windows[g:g + GROUP_SIZE]
-                hits = []
-                executor = ThreadPoolExecutor(max_workers=len(group))
-                try:
-                    futures = [
-                        executor.submit(self._scan_window, w, key, tolerant)
-                        for w in group
-                    ]
-                    for fut in futures:
-                        try:
-                            hits.extend(fut.result())
-                        except Exception:
-                            pass
-                finally:
-                    executor.shutdown(wait=True)
+            for fut in pending:
+                fut.cancel()
+            stop.set()
 
-                if hits:
-                    # Lowest row number wins, so the answer is stable no
-                    # matter which window of the group answered first.
-                    return min(hits), True
-
+            if hit:
+                # Lowest row number wins, so the answer is stable no matter
+                # which window found it first.
+                return min(hit), True
             if timed_out:
-                break
+                return None, False
 
-        return None, not timed_out
+        return None, True

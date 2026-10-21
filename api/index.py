@@ -782,9 +782,10 @@ def query_id_in_database(id_value):
     if scanner is None:
         return None
 
-    row_number, _complete = scanner.find(key, time_budget=ID_TIME_BUDGET)
+    row_number, complete = scanner.find(key, time_budget=ID_TIME_BUDGET)
     if row_number is None:
-        return None
+        # An incomplete scan cannot prove the id is absent.
+        return None if complete else "incomplete"
 
     record = duckdb_fetch_row(row_number)
     if not record:
@@ -792,6 +793,10 @@ def query_id_in_database(id_value):
     record.setdefault("id", key)
     _cache_put(cache_key, record)
     return record
+
+
+@app.route("/health")
+def health():
     return jsonify({
         "status": "ok",
         "row_groups": len(REMOTE_RGS),
@@ -828,41 +833,6 @@ def index():
     })
 
 
-@app.route("/netprobe")
-def netprobe():
-    """Temporary: measure HF CDN throughput from the Vercel runtime."""
-    import time as _time
-    from concurrent.futures import ThreadPoolExecutor as _TP
-
-    _chunk = 8 * 1024 * 1024
-
-    def _fetch(i):
-        try:
-            _s = requests.Session()
-            _start = (i * 17 + 3) * _chunk
-            _r = _s.get(
-                HF_PARQUET_URL,
-                headers={"Range": f"bytes={_start}-{_start + _chunk - 1}"},
-                timeout=120,
-            )
-            return len(_r.content)
-        except Exception:
-            return 0
-
-    _t0 = _time.time()
-    with _TP(max_workers=8) as _ex:
-        _got = list(_ex.map(_fetch, range(8)))
-    _dt = _time.time() - _t0
-    _mb = sum(_got) / 1024 / 1024
-    _rate = _mb / _dt if _dt else 0
-    return jsonify({
-        "seconds": round(_dt, 2),
-        "mb": round(_mb, 1),
-        "mb_per_s": round(_rate, 2),
-        "id_column_full_scan_seconds": round(8718 / _rate, 1) if _rate else None,
-    })
-
-
 @app.route("/api")
 def api():
     # Vehicle / license / IFSC lookups are handled by the parivahan module.
@@ -894,6 +864,21 @@ def api():
         time_start = time.time()
         record = query_id_in_database(id_value)
         _disk_cache_save()
+        if record == "incomplete":
+            # The scan ran out of time before covering the whole file, so
+            # absence cannot be proven.
+            return jsonify({
+                "success": False,
+                "error": (
+                    f"Scan for id {id_value} did not finish within the time "
+                    "budget; the record may still exist further in the file."
+                ),
+                "meta": _build_meta(
+                    cached=False,
+                    cache_hits=CACHE_HITS,
+                    latency_ms=int((time.time() - time_start) * 1000),
+                ),
+            }), 504
         if not record:
             return jsonify({
                 "success": False,
@@ -908,13 +893,14 @@ def api():
             "success": True,
             "requested_id": id_value,
             "record": {
-                "id": id_value,
+                "id": record.get("id") or id_value,
                 "mobile": record.get("mobile"),
                 "name": record.get("name"),
                 "fname": record.get("fname"),
                 "address": record.get("address"),
                 "alt": record.get("alt"),
                 "circle": record.get("circle"),
+                "email": record.get("email"),
             },
             "meta": _build_meta(
                 cached=False,
