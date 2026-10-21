@@ -1,32 +1,36 @@
 """Resolve a row by its `id` column value.
 
 The `id` column mixes numeric RC numbers, driving-licence numbers, masked
-values and usernames, and it is not sorted - so row groups cannot be pruned
-by value the way the `mobile` column can.  The only way to resolve an id is
-to read the id column.
+values and usernames, and it is not sorted - so row groups cannot be pruned by
+value the way the `mobile` column can.  The only way to resolve an id is to
+read the id column.
 
 That is still far cheaper than reading the whole file: the id column is about
 9% of the 93 GB parquet (8.7 GB compressed), and a scan that projects just
 `id` touches only those bytes.
 
-The scan is split into windows of row groups and several windows run at the
-same time.  Every worker uses its own DuckDB connection (a connection is not
-safe to use from two threads at once), and all byte-range traffic goes
-through the local Range proxy, so the parquet footer is fetched once (it is
-cached on disk) and upstream 429 throttling is retried.
+The scan is split into windows of row groups and the windows are visited in
+ascending order, a group at a time.  Each group runs its windows in parallel
+and the group stops as soon as it has a hit, which keeps the common case
+(an id that occurs early in the file) fast and the result deterministic.
+
+Every worker uses its own DuckDB connection - a connection is not safe to
+use from two threads at once - and all byte-range traffic goes through the
+local Range proxy, so the parquet footer is fetched once (it is cached on
+disk) and upstream 429 throttling is retried.
 """
 
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 # Row groups per window.  A window of 30 row groups is about 3.7 M rows,
 # roughly 18 MB of compressed id data.
 WINDOW_RGS = 30
 
-# Windows scanned concurrently.  Each window uses several DuckDB threads.
-CONCURRENT_WINDOWS = 6
+# Windows scanned concurrently inside one group.
+GROUP_SIZE = 6
 
 # DuckDB threads used inside a window.
 SCAN_THREADS = 6
@@ -67,7 +71,7 @@ def _make_scan_connection(url):
         conn.execute("LOAD httpfs;")
 
     conn.execute("SET enable_http_metadata_cache = true;")
-    conn.execute("SET http_timeout = 60000;")
+    conn.execute("SET http_timeout = 120000;")
     conn.execute(f"SET threads = {SCAN_THREADS};")
     return conn
 
@@ -105,11 +109,42 @@ class IdScanner:
             windows.append((lo, hi))
         return windows
 
+    def _scan_window(self, window, key, tolerant):
+        """Return the matching row numbers inside one window."""
+        lo, hi = window
+        lit = _sql_literal(key)
+        if tolerant:
+            # The stored id can carry padding or mixed case, so match on the
+            # trimmed and case-folded value as well.
+            condition = (
+                f"(id = {lit} OR trim(id) = {lit} "
+                f"OR lower(trim(id)) = lower({lit}))"
+            )
+        else:
+            # Plain equality keeps the hot loop cheap: no per-row function
+            # calls, which matters when scanning a billion rows.
+            condition = f"id = {lit}"
+
+        sql = f"""
+        SELECT file_row_number
+        FROM parquet_scan('{self.url}', file_row_number=true)
+        WHERE file_row_number >= {lo}
+          AND file_row_number < {hi}
+          AND {condition}
+        LIMIT 8
+        """
+        try:
+            conn = self._connection()
+            return [r[0] for r in conn.execute(sql).fetchall()]
+        except Exception:
+            return []
+
     def find(self, id_value, time_budget=240.0):
         """Return (row_number, complete).
 
         row_number is the matching row, or None.  complete is False when the
-        time budget ran out before every window was scanned.
+        time budget ran out before the whole file was scanned, which means a
+        "not found" answer is not conclusive.
         """
         key = str(id_value).strip()
         if not key:
@@ -119,54 +154,37 @@ class IdScanner:
         if not windows:
             return None, True
 
-        lit = _sql_literal(key)
-        found = threading.Event()
-        hit = []
-
-        def scan(window):
-            if found.is_set():
-                return
-            lo, hi = window
-            sql = f"""
-            SELECT file_row_number
-            FROM parquet_scan('{self.url}', file_row_number=true)
-            WHERE file_row_number >= {lo}
-              AND file_row_number < {hi}
-              AND (id = {lit}
-                   OR trim(id) = {lit}
-                   OR lower(trim(id)) = lower({lit}))
-            LIMIT 8
-            """
-            try:
-                conn = self._connection()
-                rows = conn.execute(sql).fetchall()
-                if rows:
-                    hit.append(rows[0][0])
-                    found.set()
-            except Exception:
-                pass
-
         start = time.time()
         timed_out = False
-        executor = ThreadPoolExecutor(max_workers=CONCURRENT_WINDOWS)
-        futures = []
-        try:
-            futures = [executor.submit(scan, w) for w in windows]
-            for fut in as_completed(futures):
-                try:
-                    fut.result()
-                except Exception:
-                    pass
-                if found.is_set():
-                    break
+
+        for tolerant in (False, True):
+            for g in range(0, len(windows), GROUP_SIZE):
                 if time.time() - start > time_budget:
                     timed_out = True
                     break
-        finally:
-            for f in futures:
-                f.cancel()
-            executor.shutdown(wait=False)
 
-        if hit:
-            return hit[0], True
+                group = windows[g:g + GROUP_SIZE]
+                hits = []
+                executor = ThreadPoolExecutor(max_workers=len(group))
+                try:
+                    futures = [
+                        executor.submit(self._scan_window, w, key, tolerant)
+                        for w in group
+                    ]
+                    for fut in futures:
+                        try:
+                            hits.extend(fut.result())
+                        except Exception:
+                            pass
+                finally:
+                    executor.shutdown(wait=True)
+
+                if hits:
+                    # Lowest row number wins, so the answer is stable no
+                    # matter which window of the group answered first.
+                    return min(hits), True
+
+            if timed_out:
+                break
+
         return None, not timed_out
