@@ -20,8 +20,35 @@ FOOTER_PATH = os.path.join(CACHE_DIR, "footer.bin")
 SIZE_PATH = os.path.join(CACHE_DIR, "size.txt")
 
 _session = requests.Session()
-_adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=2)
+_adapter = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=2)
 _session.mount("https://", _adapter)
+
+# Upstream occasionally answers 429 when many range requests land at once.
+# Retry with a short backoff so a scan does not die on a transient throttle.
+_MAX_RETRIES = 5
+
+
+def _remote_get(start, end):
+    """Fetch a byte range from the remote file, retrying on transient errors."""
+    last_err = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            r = _session.get(
+                REMOTE_URL,
+                headers={"Range": f"bytes={start}-{end}"},
+                timeout=300,
+            )
+            if r.status_code in (200, 206):
+                return r.content
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_err = f"HTTP {r.status_code}"
+                time.sleep(min(2 ** attempt * 0.5, 8))
+                continue
+            return None
+        except Exception as e:  # network hiccup
+            last_err = str(e)
+            time.sleep(min(2 ** attempt * 0.5, 8))
+    raise RuntimeError(f"range fetch failed after {_MAX_RETRIES} tries: {last_err}")
 
 # In-memory cache of data ranges, keyed by (start, end). Row-group data is
 # re-read across queries, so caching it keeps the proxy transparent.
@@ -72,14 +99,12 @@ def _ensure_footer():
             return False
         os.makedirs(CACHE_DIR, exist_ok=True)
         start = max(0, size - FOOTER_BYTES)
-        r = _session.get(
-            REMOTE_URL, headers={"Range": f"bytes={start}-{size-1}"}, timeout=300
-        )
-        if r.status_code not in (200, 206):
+        data = _remote_get(start, size - 1)
+        if data is None:
             return False
         tmp = FOOTER_PATH + ".tmp"
         with open(tmp, "wb") as f:
-            f.write(r.content)
+            f.write(data)
         os.replace(tmp, FOOTER_PATH)
         return True
     except Exception:
@@ -160,13 +185,7 @@ def start_proxy():
                 data = _cache_get(key)
             if data is None:
                 try:
-                    r = _session.get(
-                        remote,
-                        headers={"Range": f"bytes={start}-{end}"},
-                        timeout=300,
-                        stream=False,
-                    )
-                    data = r.content
+                    data = _remote_get(start, end)
                     _cache_put(key, data)
                 except Exception:
                     self.send_error(502)

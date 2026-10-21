@@ -203,8 +203,31 @@ if DUCKDB_AVAILABLE:
 # Vercel Hobby supports up to 300s with Fluid compute
 TIME_BUDGET = 270.0
 
+# Time budget for an id scan. Slightly shorter than the phone budget so the
+# record fetch still has room inside the function timeout.
+ID_TIME_BUDGET = 240.0
+
 # Maximum number of linked records to trace (main number + 4 alt hops)
 MAX_STEPS = 5
+
+# Lazily created scanner for id lookups (separate DuckDB connection).
+_ID_SCANNER = None
+_ID_SCANNER_LOCK = threading.Lock()
+
+
+def _get_id_scanner():
+    """Return the shared IdScanner instance, creating it on first use."""
+    global _ID_SCANNER
+    if _ID_SCANNER is None:
+        with _ID_SCANNER_LOCK:
+            if _ID_SCANNER is None:
+                try:
+                    from api.idlookup import IdScanner
+
+                    _ID_SCANNER = IdScanner(HF_PARQUET_URL, REMOTE_RGS)
+                except Exception:
+                    return None
+    return _ID_SCANNER
 
 # In-memory LRU cache of resolved records (survives across warm invocations)
 _CACHE = {}
@@ -480,12 +503,14 @@ def duckdb_fetch_row(row_number, conn=None):
             if rows:
                 r = rows[0].get("row", {})
                 return {
+                    "id": clean_field(r.get("id")),
                     "mobile": clean_field(r.get("mobile")),
                     "name": clean_field(r.get("name")),
                     "fname": clean_field(r.get("fname")),
                     "address": clean_field(r.get("address")),
                     "alt": clean_field(r.get("alt")),
                     "circle": clean_field(r.get("circle")),
+                    "email": clean_field(r.get("email")),
                 }
     except Exception:
         pass
@@ -495,7 +520,7 @@ def duckdb_fetch_row(row_number, conn=None):
     if c is None:
         return None
     sql = f"""
-    SELECT mobile, name, fname, address, alt, circle
+    SELECT id, mobile, name, fname, address, alt, circle, email
     FROM parquet_scan('{HF_PARQUET_URL}', file_row_number=true)
     WHERE file_row_number = {row_number}
     LIMIT 1
@@ -726,8 +751,47 @@ def _parallel_two_phase(row_groups, phone_digits, time_start):
         return None
 
 
-@app.route("/health")
-def health():
+def query_id_in_database(id_value):
+    """Look up a record by its `id` value.
+
+    The id column is not sorted, so this scans the id column of the remote
+    parquet. The scan is windowed and parallel, and stops as soon as a
+    matching row is found.
+    """
+    global CACHE_HITS, CACHE_MISSES
+
+    key = str(id_value).strip()
+    if not key:
+        return None
+
+    cache_key = f"id:{key}"
+    if cache_key in _CACHE:
+        CACHE_HITS += 1
+        return _CACHE[cache_key]
+    if cache_key in DISK_CACHE:
+        CACHE_HITS += 1
+        rec = DISK_CACHE[cache_key]
+        _CACHE[cache_key] = rec
+        return rec
+    CACHE_MISSES += 1
+
+    if CON is None:
+        return None
+
+    scanner = _get_id_scanner()
+    if scanner is None:
+        return None
+
+    row_number, _complete = scanner.find(key, time_budget=ID_TIME_BUDGET)
+    if row_number is None:
+        return None
+
+    record = duckdb_fetch_row(row_number)
+    if not record:
+        return None
+    record.setdefault("id", key)
+    _cache_put(cache_key, record)
+    return record
     return jsonify({
         "status": "ok",
         "row_groups": len(REMOTE_RGS),
@@ -739,6 +803,7 @@ def health():
         "cache_misses": CACHE_MISSES,
         "endpoints": {
             "phone": "/api?phone=9876543210",
+            "id": "/api?id=417479131232",
             "vehicle": "/api?vehical=MH12DE1433",
             "license": "/api?license=DL0420110149646",
             "ifsc": "/api?ifsc=SBIN0000001",
@@ -753,12 +818,48 @@ def index():
         "service": "Hugging Face dataset lookup API",
         "endpoints": {
             "phone": "/api?phone=9876543210",
+            "id": "/api?id=417479131232",
             "vehicle": "/api?vehical=MH12DE1433",
             "license": "/api?license=DL0420110149646",
             "ifsc": "/api?ifsc=SBIN0000001",
         },
         "health": "/health",
         "meta": _build_meta(cached=False, cache_hits=CACHE_HITS, latency_ms=0),
+    })
+
+
+@app.route("/netprobe")
+def netprobe():
+    """Temporary: measure HF CDN throughput from the Vercel runtime."""
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor as _TP
+
+    _chunk = 8 * 1024 * 1024
+
+    def _fetch(i):
+        try:
+            _s = requests.Session()
+            _start = (i * 17 + 3) * _chunk
+            _r = _s.get(
+                HF_PARQUET_URL,
+                headers={"Range": f"bytes={_start}-{_start + _chunk - 1}"},
+                timeout=120,
+            )
+            return len(_r.content)
+        except Exception:
+            return 0
+
+    _t0 = _time.time()
+    with _TP(max_workers=8) as _ex:
+        _got = list(_ex.map(_fetch, range(8)))
+    _dt = _time.time() - _t0
+    _mb = sum(_got) / 1024 / 1024
+    _rate = _mb / _dt if _dt else 0
+    return jsonify({
+        "seconds": round(_dt, 2),
+        "mb": round(_mb, 1),
+        "mb_per_s": round(_rate, 2),
+        "id_column_full_scan_seconds": round(8718 / _rate, 1) if _rate else None,
     })
 
 
@@ -773,18 +874,54 @@ def api():
             return jsonify(_body), _status
 
     phone = request.args.get("phone")
-    if not phone:
+    id_value = request.args.get("id")
+    if not phone and not id_value:
         return jsonify({
             "success": False,
             "error": "Missing parameter.",
             "examples": {
                 "phone": "/api?phone=9876543210",
+                "id": "/api?id=417479131232",
                 "vehicle": "/api?vehical=MH12DE1433",
                 "license": "/api?license=DL0420110149646",
                 "ifsc": "/api?ifsc=SBIN0000001",
             },
             "meta": _build_meta(cached=False, cache_hits=CACHE_HITS, latency_ms=0),
         }), 400
+
+    # Lookup by id
+    if id_value:
+        time_start = time.time()
+        record = query_id_in_database(id_value)
+        _disk_cache_save()
+        if not record:
+            return jsonify({
+                "success": False,
+                "error": f"Record for id {id_value} not found in database",
+                "meta": _build_meta(
+                    cached=False,
+                    cache_hits=CACHE_HITS,
+                    latency_ms=int((time.time() - time_start) * 1000),
+                ),
+            }), 404
+        return jsonify({
+            "success": True,
+            "requested_id": id_value,
+            "record": {
+                "id": id_value,
+                "mobile": record.get("mobile"),
+                "name": record.get("name"),
+                "fname": record.get("fname"),
+                "address": record.get("address"),
+                "alt": record.get("alt"),
+                "circle": record.get("circle"),
+            },
+            "meta": _build_meta(
+                cached=False,
+                cache_hits=CACHE_HITS,
+                latency_ms=int((time.time() - time_start) * 1000),
+            ),
+        })
 
     current_lookup = ''.join(c for c in phone if c.isdigit())[-10:]
     if not current_lookup:
