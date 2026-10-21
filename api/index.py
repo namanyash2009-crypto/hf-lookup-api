@@ -200,16 +200,25 @@ def find_row_groups_by_range(phone_digits):
         # Accurate index available: use the true first-row value of each row
         # group, which brackets the number much more precisely.
         hits = []
+        fallback = []
         for r in ACC_RGS:
-            lo = r["m"]
-            hi = r["f"]
-            if lo > hi:
-                lo, hi = hi, lo
+            lo, hi = min(r["m"], r["f"]), max(r["m"], r["f"])
             if lo <= val <= hi:
                 hits.append((hi - lo, abs((lo + hi) // 2 - val), r))
+            elif r["m"] <= val <= r["M"]:
+                # Parquet statistics can be stale for some row groups; keep
+                # these as a lower-priority fallback.
+                fallback.append((r["M"] - r["m"], abs((r["m"] + r["M"]) // 2 - val), r))
         if hits:
             hits.sort(key=lambda t: (t[0], t[1]))
-            return [h[2] for h in hits]
+            ordered = [h[2] for h in hits]
+            if fallback:
+                fallback.sort(key=lambda t: (t[0], t[1]))
+                ordered += [f[2] for f in fallback]
+            return ordered
+        if fallback:
+            fallback.sort(key=lambda t: (t[0], t[1]))
+            return [f[2] for f in fallback]
         # Number not claimed by any row group - use the closest ones.
         closest = sorted(
             ACC_RGS,
